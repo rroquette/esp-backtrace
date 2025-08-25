@@ -1,9 +1,10 @@
+use addr2line;
+use addr2line::fallible_iterator::FallibleIterator;
+use chrono::Utc;
+use chrono::prelude::DateTime;
 use clap::{Arg, ArgAction, arg, command};
 use regex::Regex;
-use std::time::{UNIX_EPOCH, Duration};
-use chrono::prelude::DateTime;
-use chrono::Utc;
-
+use std::time::{Duration, UNIX_EPOCH};
 
 static RE_PC: &str = r"\s*?PC\s*?:(0x4[0-2][0-9][0-9A-Fa-f]*)";
 static RE_BT: &str = r"Backtrace:\s?(.*)";
@@ -137,27 +138,57 @@ fn extract_backtraces(log: &str) -> Vec<Backtrace> {
 
 impl Backtrace {
     fn print_unwrap(&self, name: &String, elf: &String) {
-        let gdb_cmd = std::process::Command::new("addr2line")
-            .arg("-pif") // pretty print functions
-            .args(["-e", elf])
-            .arg(self.pc.as_str())
-            .args(self.stack.iter().map(|entry| entry.name.as_str()))
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("Failed to start addr2line process");
+        let loader = addr2line::Loader::new(elf).unwrap();
 
-        let output = gdb_cmd
-            .wait_with_output()
-            .expect("Failed to wait on gdb process");
-        if !output.status.success() {
-            eprintln!("gdb process failed with status: {}", output.status);
-            return;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
         println!("Stacktrace {}", name);
-        for (i, line) in stdout.lines().enumerate() {
+
+        for (i, addr) in self
+            .stack
+            .iter()
+            .map(|entry| u64::from_str_radix(entry.name.trim_start_matches("0x"), 16).unwrap())
+            .enumerate()
+        {
+            let Ok(frames) = loader.find_frames(addr) else {
+                eprintln!("SP-{:2}: {} ??", i, self.stack[i].addr);
+                continue;
+            };
+
+            let Some(frame) = frames.unwrap().next() else {
+                if i < self.stack.len() {
+                    eprintln!("SP-{:2}: {} ??", i, self.stack[i].addr);
+                }
+                continue;
+            };
+
+            let Some(loc) = frame.location else {
+                if i < self.stack.len() {
+                    eprintln!("SP-{:2}: {} ??", i, self.stack[i].addr);
+                }
+                continue;
+            };
+
+            let Some(fn_name) = frame.function else {
+                if i < self.stack.len() {
+                    eprintln!(
+                        "SP-{:2}: {} ?? ({}:{})",
+                        i,
+                        self.stack[i].addr,
+                        loc.file.unwrap_or("??"),
+                        loc.line.unwrap_or(0)
+                    );
+                }
+                continue;
+            };
+
             if i < self.stack.len() {
-                println!("SP-{:2}: {} ({})", i, self.stack[i].addr, line);
+                println!(
+                    "SP-{:2}: {} in {} ({}:{})",
+                    i,
+                    self.stack[i].addr,
+                    fn_name.demangle().unwrap_or(std::borrow::Cow::from("??")),
+                    loc.file.unwrap_or("??"),
+                    loc.line.unwrap_or(0),
+                );
             }
         }
         println!();
